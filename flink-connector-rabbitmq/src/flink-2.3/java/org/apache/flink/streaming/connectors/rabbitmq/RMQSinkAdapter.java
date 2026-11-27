@@ -15,14 +15,22 @@
  * limitations under the License.
  */
 
-package org.apache.flink.streaming.connectors.rabbitmq.test;
+package org.apache.flink.streaming.connectors.rabbitmq;
 
-/**
- * Utility class for defining the image names and versions of Docker containers used during the Java
- * tests. The names/versions are centralised here in order to make testing version updates easier,
- * as well as to provide a central file to use as a key when caching testing Docker files.
- */
-public class DockerImageVersions {
+import org.apache.flink.api.common.serialization.SerializationSchema;
+import org.apache.flink.api.connector.sink2.Sink;
+import org.apache.flink.api.connector.sink2.SinkWriter;
+import org.apache.flink.api.connector.sink2.WriterInitContext;
 
-    public static final String RABBITMQ = "rabbitmq:3.12.12-management-alpine";
+import java.io.IOException;
+
+/** Bridges the writer factory signatures on the supported Flink lines. */
+abstract class RMQSinkAdapter<T> implements Sink<T> {
+    abstract SinkWriter<T> openWriter(SerializationSchema.InitializationContext context)
+            throws IOException;
+
+    @Override
+    public final SinkWriter<T> createWriter(WriterInitContext context) throws IOException {
+        return openWriter(context.asSerializationSchemaInitializationContext());
+    }
 }

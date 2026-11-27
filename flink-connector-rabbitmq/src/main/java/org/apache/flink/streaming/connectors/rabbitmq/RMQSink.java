@@ -18,10 +18,8 @@
 package org.apache.flink.streaming.connectors.rabbitmq;
 
 import org.apache.flink.annotation.PublicEvolving;
-import org.apache.flink.api.common.serialization.RuntimeContextInitializationContextAdapters;
 import org.apache.flink.api.common.serialization.SerializationSchema;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
+import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.streaming.connectors.rabbitmq.common.RMQConnectionConfig;
 import org.apache.flink.util.Preconditions;
 
@@ -34,14 +32,14 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
-import java.util.concurrent.TimeoutException;
 
 /**
  * A Sink for publishing data into RabbitMQ.
  *
  * @param <IN>
  */
-public class RMQSink<IN> extends RichSinkFunction<IN> {
+@PublicEvolving
+public class RMQSink<IN> extends RMQSinkAdapter<IN> {
     private static final long serialVersionUID = 1L;
 
     private static final Logger LOG = LoggerFactory.getLogger(RMQSink.class);
@@ -49,9 +47,7 @@ public class RMQSink<IN> extends RichSinkFunction<IN> {
     @Nullable protected final String queueName;
 
     private final RMQConnectionConfig rmqConnectionConfig;
-    protected transient Connection connection;
-    protected transient Channel channel;
-    protected SerializationSchema<IN> schema;
+    private final SerializationSchema<IN> schema;
     private boolean logFailuresOnly = false;
 
     @Nullable private final RMQSinkPublishOptions<IN> publishOptions;
@@ -130,7 +126,7 @@ public class RMQSink<IN> extends RichSinkFunction<IN> {
      * this method to have a custom setup for the queue (i.e. binding the queue to an exchange or
      * defining custom queue parameters)
      */
-    protected void setupQueue() throws IOException {
+    protected void setupQueue(Channel channel) throws IOException {
         if (queueName != null) {
             Util.declareQueueDefaults(channel, queueName);
         }
@@ -165,105 +161,89 @@ public class RMQSink<IN> extends RichSinkFunction<IN> {
     }
 
     @Override
-    public void open(Configuration config) throws Exception {
-        schema.open(
-                RuntimeContextInitializationContextAdapters.serializationAdapter(
-                        getRuntimeContext(), metricGroup -> metricGroup.addGroup("user")));
-
+    SinkWriter<IN> openWriter(SerializationSchema.InitializationContext context)
+            throws IOException {
+        Writer writer = new Writer();
         try {
-            connection = setupConnection();
-            channel = connection.createChannel();
-            if (channel == null) {
-                throw new RuntimeException("None of RabbitMQ channels are available");
+            schema.open(context);
+            writer.connection = setupConnection();
+            writer.channel = writer.connection.createChannel();
+            if (writer.channel == null) {
+                throw new IOException("None of RabbitMQ channels are available");
             }
-            setupQueue();
+            setupQueue(writer.channel);
             if (returnListener != null) {
-                channel.addReturnListener(returnListener);
+                writer.channel.addReturnListener(returnListener);
             }
-        } catch (IOException e) {
-            throw new RuntimeException("Error while creating the RabbitMQ channel", e);
+            return writer;
+        } catch (Exception e) {
+            try {
+                writer.close();
+            } catch (Exception closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw new IOException("Could not initialize RabbitMQ sink", e);
         }
     }
 
-    /**
-     * Called when new data arrives to the sink, and forwards it to RMQ.
-     *
-     * @param value The incoming data
-     */
-    @Override
-    public void invoke(IN value) {
-        try {
-            byte[] msg = schema.serialize(value);
+    private final class Writer implements SinkWriter<IN> {
+        private Connection connection;
+        private Channel channel;
 
-            if (publishOptions == null) {
-                channel.basicPublish("", queueName, null, msg);
-            } else {
-                boolean mandatory = publishOptions.computeMandatory(value);
-                boolean immediate = publishOptions.computeImmediate(value);
+        @Override
+        public void write(IN value, Context context) throws IOException {
+            try {
+                byte[] msg = schema.serialize(value);
 
-                Preconditions.checkState(
-                        !(returnListener == null && (mandatory || immediate)),
-                        "Setting mandatory and/or immediate flags to true requires a ReturnListener.");
+                if (publishOptions == null) {
+                    channel.basicPublish("", queueName, null, msg);
+                } else {
+                    boolean mandatory = publishOptions.computeMandatory(value);
+                    boolean immediate = publishOptions.computeImmediate(value);
 
-                String rk = publishOptions.computeRoutingKey(value);
-                String exchange = publishOptions.computeExchange(value);
+                    Preconditions.checkState(
+                            !(returnListener == null && (mandatory || immediate)),
+                            "Setting mandatory and/or immediate flags to true requires a ReturnListener.");
 
-                channel.basicPublish(
-                        exchange,
-                        rk,
-                        mandatory,
-                        immediate,
-                        publishOptions.computeProperties(value),
-                        msg);
-            }
-        } catch (IOException e) {
-            if (logFailuresOnly) {
-                LOG.error(
-                        "Cannot send RMQ message {} at {}",
-                        queueName,
-                        rmqConnectionConfig.getHost(),
-                        e);
-            } else {
-                throw new RuntimeException(
-                        "Cannot send RMQ message "
-                                + queueName
-                                + " at "
-                                + rmqConnectionConfig.getHost(),
-                        e);
+                    String rk = publishOptions.computeRoutingKey(value);
+                    String exchange = publishOptions.computeExchange(value);
+
+                    channel.basicPublish(
+                            exchange,
+                            rk,
+                            mandatory,
+                            immediate,
+                            publishOptions.computeProperties(value),
+                            msg);
+                }
+            } catch (IOException e) {
+                if (logFailuresOnly) {
+                    LOG.error(
+                            "Cannot send RMQ message {} at {}",
+                            queueName,
+                            rmqConnectionConfig.getHost(),
+                            e);
+                } else {
+                    throw new IOException(
+                            "Cannot send RMQ message "
+                                    + queueName
+                                    + " at "
+                                    + rmqConnectionConfig.getHost(),
+                            e);
+                }
             }
         }
-    }
 
-    @Override
-    public void close() {
-        Exception t = null;
-        try {
-            if (channel != null) {
-                channel.close();
-            }
-        } catch (IOException | TimeoutException e) {
-            t = e;
+        @Override
+        public void flush(boolean endOfInput) {
+            // Publish calls are synchronous; this sink does not enable publisher confirms.
         }
 
-        try {
-            if (connection != null) {
-                connection.close();
+        @Override
+        public void close() throws Exception {
+            try (Connection openConnection = connection; Channel openChannel = channel) {
+                // Close channel before connection, preserving errors from both.
             }
-        } catch (IOException e) {
-            if (t != null) {
-                LOG.warn(
-                        "Both channel and connection closing failed. Logging channel exception and failing with connection exception",
-                        t);
-            }
-            t = e;
-        }
-        if (t != null) {
-            throw new RuntimeException(
-                    "Error while closing RMQ connection with "
-                            + queueName
-                            + " at "
-                            + rmqConnectionConfig.getHost(),
-                    t);
         }
     }
 }

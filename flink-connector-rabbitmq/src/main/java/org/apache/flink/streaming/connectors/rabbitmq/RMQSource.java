@@ -17,430 +17,594 @@
 
 package org.apache.flink.streaming.connectors.rabbitmq;
 
-import org.apache.flink.annotation.VisibleForTesting;
-import org.apache.flink.api.common.functions.RuntimeContext;
+import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
-import org.apache.flink.api.common.serialization.RuntimeContextInitializationContextAdapters;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.api.connector.source.ReaderOutput;
+import org.apache.flink.api.connector.source.Source;
+import org.apache.flink.api.connector.source.SourceReader;
+import org.apache.flink.api.connector.source.SourceReaderContext;
+import org.apache.flink.api.connector.source.SourceSplit;
+import org.apache.flink.api.connector.source.SplitEnumerator;
+import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.streaming.api.functions.source.MessageAcknowledgingSourceBase;
-import org.apache.flink.streaming.api.functions.source.MultipleIdsMessageAcknowledgingSourceBase;
-import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
+import org.apache.flink.core.execution.CheckpointingMode;
+import org.apache.flink.core.io.InputStatus;
+import org.apache.flink.core.io.SimpleVersionedSerializer;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.environment.CheckpointConfig;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.connectors.rabbitmq.common.RMQConnectionConfig;
-import org.apache.flink.util.ExceptionUtils;
-import org.apache.flink.util.IOUtils;
-import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.UserCodeClassLoader;
 
 import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
+import com.rabbitmq.client.DefaultConsumer;
 import com.rabbitmq.client.Delivery;
 import com.rabbitmq.client.Envelope;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.rabbitmq.client.ShutdownSignalException;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Objects;
+import java.util.Queue;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 
-/**
- * RabbitMQ source (consumer) which reads from a queue and acknowledges messages on checkpoints.
- * When checkpointing is enabled, it guarantees exactly-once processing semantics.
- *
- * <p>RabbitMQ requires messages to be acknowledged. On failures, RabbitMQ will re-resend all
- * messages which have not been acknowledged previously. When a failure occurs directly after a
- * completed checkpoint, all messages part of this checkpoint might be processed again because they
- * couldn't be acknowledged before failure. This case is handled by the {@link
- * MessageAcknowledgingSourceBase} base class which deduplicates the messages using the correlation
- * id.
- *
- * <p>RabbitMQ's Delivery Tags do NOT represent unique ids / offsets. That's why the source uses the
- * Correlation ID in the message properties to check for duplicate messages. Note that the
- * correlation id has to be set at the producer. If the correlation id is not set, messages may be
- * produced more than once in corner cases.
- *
- * <p>This source can be operated in three different modes:
- *
- * <p>1) Exactly-once (when checkpointed) with RabbitMQ transactions and messages with unique
- * correlation IDs. 2) At-least-once (when checkpointed) with RabbitMQ transactions but no
- * deduplication mechanism (correlation id is not set). 3) No strong delivery guarantees (without
- * checkpointing) with RabbitMQ auto-commit mode.
- *
- * <p>Users may overwrite the setupConnectionFactory() method to pass their setup their own
- * ConnectionFactory in case the constructor parameters are not sufficient.
- *
- * @param <OUT> The type of the data read from RabbitMQ.
- */
-public class RMQSource<OUT> extends MultipleIdsMessageAcknowledgingSourceBase<OUT, String, Long>
-        implements ResultTypeQueryable<OUT> {
-
+/** An unbounded RabbitMQ queue source. Use {@link #addTo} to validate checkpoint settings. */
+@PublicEvolving
+public class RMQSource<OUT>
+        implements Source<OUT, RMQSource.Split, List<RMQSource.Split>>, ResultTypeQueryable<OUT> {
     private static final long serialVersionUID = 1L;
 
-    private static final Logger LOG = LoggerFactory.getLogger(RMQSource.class);
+    /** Determines when RabbitMQ may remove deliveries from its queue. */
+    @PublicEvolving
+    public enum AcknowledgementMode {
+        /** The broker removes messages when delivered, independently of Flink. */
+        AUTO_ACK,
+        /** Acknowledge completed checkpoints. Checkpointing must be enabled. */
+        AT_LEAST_ONCE,
+        /** Checkpoint and deduplicate unique producer correlation IDs at parallelism one. */
+        EXACTLY_ONCE
+    }
 
-    private final RMQConnectionConfig rmqConnectionConfig;
-    protected final String queueName;
-    private final boolean usesCorrelationId;
-    protected RMQDeserializationSchema<OUT> deliveryDeserializer;
+    private final RMQConnectionConfig config;
+    private final String queueName;
+    private final AcknowledgementMode mode;
+    private final RMQDeserializationSchema<OUT> schema;
 
-    protected transient Connection connection;
-    protected transient Channel channel;
-    protected transient QueueingConsumer consumer;
-
-    protected transient boolean autoAck;
-
-    private transient volatile boolean running;
-
-    /**
-     * Creates a new RabbitMQ source with at-least-once message processing guarantee when
-     * checkpointing is enabled. No strong delivery guarantees when checkpointing is disabled.
-     *
-     * <p>For exactly-once, please use the constructor {@link
-     * RMQSource#RMQSource(RMQConnectionConfig, String, boolean, DeserializationSchema)}.
-     *
-     * @param rmqConnectionConfig The RabbiMQ connection configuration {@link RMQConnectionConfig}.
-     * @param queueName The queue to receive messages from.
-     * @param deserializationSchema A {@link DeserializationSchema} for turning the bytes received
-     *     into Java objects.
-     */
     public RMQSource(
-            RMQConnectionConfig rmqConnectionConfig,
+            RMQConnectionConfig config,
             String queueName,
-            DeserializationSchema<OUT> deserializationSchema) {
-        this(rmqConnectionConfig, queueName, false, deserializationSchema);
+            AcknowledgementMode mode,
+            DeserializationSchema<OUT> schema) {
+        this(config, queueName, mode, new RMQDeserializationSchemaWrapper<>(schema));
     }
 
-    /**
-     * Creates a new RabbitMQ source. For exactly-once, you must set the correlation ids of messages
-     * at the producer. The correlation id must be unique. Otherwise the behavior of the source is
-     * undefined. If in doubt, set usesCorrelationId to false. When correlation ids are not used,
-     * this source has at-least-once processing semantics when checkpointing is enabled.
-     *
-     * @param rmqConnectionConfig The RabbiMQ connection configuration {@link RMQConnectionConfig}.
-     * @param queueName The queue to receive messages from.
-     * @param usesCorrelationId Whether the messages received are supplied with a <b>unique</b> id
-     *     to deduplicate messages (in case of failed acknowledgments). Only used when checkpointing
-     *     is enabled.
-     * @param deserializationSchema A {@link DeserializationSchema} for turning the bytes received
-     *     into Java objects.
-     */
     public RMQSource(
-            RMQConnectionConfig rmqConnectionConfig,
+            RMQConnectionConfig config,
             String queueName,
-            boolean usesCorrelationId,
-            DeserializationSchema<OUT> deserializationSchema) {
-        super(String.class);
-        this.rmqConnectionConfig = rmqConnectionConfig;
-        this.queueName = queueName;
-        this.usesCorrelationId = usesCorrelationId;
-        this.deliveryDeserializer = new RMQDeserializationSchemaWrapper<>(deserializationSchema);
+            AcknowledgementMode mode,
+            RMQDeserializationSchema<OUT> schema) {
+        this.config = Objects.requireNonNull(config);
+        this.queueName = Objects.requireNonNull(queueName);
+        this.mode = Objects.requireNonNull(mode);
+        this.schema = Objects.requireNonNull(schema);
     }
 
     /**
-     * Creates a new RabbitMQ source with at-least-once message processing guarantee when
-     * checkpointing is enabled. No strong delivery guarantees when checkpointing is disabled.
+     * Adds this source after validating the environment's checkpoint settings. Configure
+     * checkpointing before calling this method and do not disable or weaken it afterwards.
      *
-     * <p>For exactly-once, please use the constructor {@link
-     * RMQSource#RMQSource(RMQConnectionConfig, String, boolean, RMQDeserializationSchema)}.
-     *
-     * <p>It also uses the provided {@link RMQDeserializationSchema} to parse both the correlationID
-     * and the message.
-     *
-     * @param rmqConnectionConfig The RabbiMQ connection configuration {@link RMQConnectionConfig}.
-     * @param queueName The queue to receive messages from.
-     * @param deliveryDeserializer A {@link RMQDeserializationSchema} for parsing the RMQDelivery.
+     * @throws IllegalArgumentException if the environment does not meet the acknowledgement mode's
+     *     checkpoint requirements
      */
-    public RMQSource(
-            RMQConnectionConfig rmqConnectionConfig,
-            String queueName,
-            RMQDeserializationSchema<OUT> deliveryDeserializer) {
-        this(rmqConnectionConfig, queueName, false, deliveryDeserializer);
-    }
-
-    /**
-     * Creates a new RabbitMQ source. For exactly-once, you must set the correlation ids of messages
-     * at the producer. The correlation id must be unique. Otherwise the behavior of the source is
-     * undefined. If in doubt, set usesCorrelationId to false. When correlation ids are not used,
-     * this source has at-least-once processing semantics when checkpointing is enabled.
-     *
-     * <p>It also uses the provided {@link RMQDeserializationSchema} to parse both the correlationID
-     * and the message.
-     *
-     * @param rmqConnectionConfig The RabbiMQ connection configuration {@link RMQConnectionConfig}.
-     * @param queueName The queue to receive messages from.
-     * @param usesCorrelationId Whether the messages received are supplied with a <b>unique</b> id
-     *     to deduplicate messages (in case of failed acknowledgments). Only used when checkpointing
-     *     is enabled.
-     * @param deliveryDeserializer A {@link RMQDeserializationSchema} for parsing the RMQDelivery.
-     */
-    public RMQSource(
-            RMQConnectionConfig rmqConnectionConfig,
-            String queueName,
-            boolean usesCorrelationId,
-            RMQDeserializationSchema<OUT> deliveryDeserializer) {
-        super(String.class);
-        this.rmqConnectionConfig = rmqConnectionConfig;
-        this.queueName = queueName;
-        this.usesCorrelationId = usesCorrelationId;
-        this.deliveryDeserializer = deliveryDeserializer;
-    }
-
-    /**
-     * Initializes the connection to RMQ with a default connection factory. The user may override
-     * this method to setup and configure their own {@link ConnectionFactory}.
-     */
-    protected ConnectionFactory setupConnectionFactory() throws Exception {
-        return rmqConnectionConfig.getConnectionFactory();
-    }
-
-    /**
-     * Initializes the connection to RMQ using the default connection factory from {@link
-     * #setupConnectionFactory()}. The user may override this method to setup and configure their
-     * own {@link Connection}.
-     */
-    @VisibleForTesting
-    protected Connection setupConnection() throws Exception {
-        return setupConnectionFactory().newConnection();
-    }
-
-    /**
-     * Initializes the consumer's {@link Channel}. If a prefetch count has been set in {@link
-     * RMQConnectionConfig}, the new channel will be use it for {@link Channel#basicQos(int)}.
-     *
-     * @param connection the consumer's {@link Connection}.
-     * @return the channel.
-     * @throws Exception if there is an issue creating or configuring the channel.
-     */
-    private Channel setupChannel(Connection connection) throws Exception {
-        Channel chan = connection.createChannel();
-        if (rmqConnectionConfig.getPrefetchCount().isPresent()) {
-            // set the global flag for the entire channel, though shouldn't make a difference
-            // since there is only one consumer, and each parallel instance of the source will
-            // create a new connection (and channel)
-            chan.basicQos(rmqConnectionConfig.getPrefetchCount().get(), true);
+    public final DataStreamSource<OUT> addTo(
+            StreamExecutionEnvironment env, WatermarkStrategy<OUT> watermarks, String name) {
+        CheckpointConfig checkpoints = env.getCheckpointConfig();
+        if (mode != AcknowledgementMode.AUTO_ACK && !checkpoints.isCheckpointingEnabled()) {
+            throw new IllegalArgumentException("RabbitMQ " + mode + " requires Flink checkpointing");
         }
-        return chan;
-    }
-
-    /**
-     * Sets up the queue. The default implementation just declares the queue. The user may override
-     * this method to have a custom setup for the queue (i.e. binding the queue to an exchange or
-     * defining custom queue parameters)
-     */
-    @VisibleForTesting
-    protected void setupQueue() throws IOException {
-        Util.declareQueueDefaults(channel, queueName);
-    }
-
-    @Override
-    public void open(Configuration config) throws Exception {
-        super.open(config);
-        sessionIds = new ArrayList<>(64);
-        sessionIdsPerSnapshot = new ArrayDeque<>();
-        try {
-            connection = setupConnection();
-            channel = setupChannel(connection);
-            if (channel == null) {
-                throw new RuntimeException("None of RabbitMQ channels are available");
-            }
-            setupQueue();
-            consumer = new QueueingConsumer(channel);
-
-            RuntimeContext runtimeContext = getRuntimeContext();
-            if (runtimeContext instanceof StreamingRuntimeContext
-                    && ((StreamingRuntimeContext) runtimeContext).isCheckpointingEnabled()) {
-                autoAck = false;
-                // enables transaction mode
-                channel.txSelect();
-            } else {
-                autoAck = true;
-            }
-
-            LOG.debug("Starting RabbitMQ source with autoAck status: " + autoAck);
-            channel.basicConsume(queueName, autoAck, consumer);
-
-        } catch (IOException e) {
-            IOUtils.closeAllQuietly(channel, connection);
-            throw new RuntimeException(
-                    "Cannot create RMQ connection with "
-                            + queueName
-                            + " at "
-                            + rmqConnectionConfig.getHost(),
-                    e);
+        if (mode == AcknowledgementMode.EXACTLY_ONCE
+                && checkpoints.getCheckpointingConsistencyMode() != CheckpointingMode.EXACTLY_ONCE) {
+            throw new IllegalArgumentException(
+                    "RabbitMQ EXACTLY_ONCE requires Flink EXACTLY_ONCE checkpoint mode");
         }
-        this.deliveryDeserializer.open(
-                RuntimeContextInitializationContextAdapters.deserializationAdapter(
-                        getRuntimeContext(), metricGroup -> metricGroup.addGroup("user")));
-        running = true;
-    }
-
-    @Override
-    public void close() throws Exception {
-        super.close();
-        Exception exception = null;
-
-        try {
-            if (consumer != null && channel != null) {
-                channel.basicCancel(consumer.getConsumerTag());
-            }
-        } catch (IOException e) {
-            exception =
-                    new RuntimeException(
-                            "Error while cancelling RMQ consumer on "
-                                    + queueName
-                                    + " at "
-                                    + rmqConnectionConfig.getHost(),
-                            e);
-        }
-
-        try {
-            IOUtils.closeAll(channel, connection);
-        } catch (IOException e) {
-            exception =
-                    ExceptionUtils.firstOrSuppressed(
-                            new RuntimeException(
-                                    "Error while closing RMQ source with "
-                                            + queueName
-                                            + " at "
-                                            + rmqConnectionConfig.getHost(),
-                                    e),
-                            exception);
-        }
-
-        if (exception != null) {
-            throw exception;
-        }
-    }
-
-    private void processMessage(Delivery delivery, RMQCollectorImpl collector) throws IOException {
-        AMQP.BasicProperties properties = delivery.getProperties();
-        byte[] body = delivery.getBody();
-        Envelope envelope = delivery.getEnvelope();
-        collector.setFallBackIdentifiers(properties.getCorrelationId(), envelope.getDeliveryTag());
-        deliveryDeserializer.deserialize(envelope, properties, body, collector);
-    }
-
-    @Override
-    public void run(SourceContext<OUT> ctx) throws Exception {
-        final RMQCollectorImpl collector = new RMQCollectorImpl(ctx);
-        final long timeout = rmqConnectionConfig.getDeliveryTimeout();
-        while (running) {
-            Delivery delivery = consumer.nextDelivery(timeout);
-
-            synchronized (ctx.getCheckpointLock()) {
-                if (delivery != null) {
-                    processMessage(delivery, collector);
-                }
-                if (collector.isEndOfStreamSignalled()) {
-                    this.running = false;
-                    return;
-                }
-            }
-        }
-    }
-
-    @Override
-    public void cancel() {
-        running = false;
-    }
-
-    @Override
-    protected void acknowledgeSessionIDs(List<Long> sessionIds) {
-        try {
-            for (long id : sessionIds) {
-                channel.basicAck(id, false);
-            }
-            channel.txCommit();
-        } catch (IOException e) {
-            throw new RuntimeException(
-                    "Messages could not be acknowledged during checkpoint creation.", e);
-        }
+        return env.fromSource(this, watermarks, name);
     }
 
     @Override
     public TypeInformation<OUT> getProducedType() {
-        return deliveryDeserializer.getProducedType();
+        return schema.getProducedType();
     }
 
-    /**
-     * Special collector for RMQ messages. Captures the correlation ID and delivery tag also does
-     * the filtering logic for weather a message has been processed or not.
-     */
-    private class RMQCollectorImpl implements RMQDeserializationSchema.RMQCollector<OUT> {
-        private final SourceContext<OUT> ctx;
-        private boolean endOfStreamSignalled = false;
-        private String correlationId;
-        private long deliveryTag;
-        private boolean customIdentifiersSet = false;
+    @Override
+    public Boundedness getBoundedness() {
+        return Boundedness.CONTINUOUS_UNBOUNDED;
+    }
 
-        private RMQCollectorImpl(SourceContext<OUT> ctx) {
-            this.ctx = ctx;
+    @Override
+    public SourceReader<OUT, Split> createReader(SourceReaderContext context) {
+        return new Reader(context);
+    }
+
+    @Override
+    public SplitEnumerator<Split, List<Split>> createEnumerator(
+            SplitEnumeratorContext<Split> context) {
+        List<Split> splits = new ArrayList<>();
+        for (int index = 0; index < context.currentParallelism(); index++) {
+            splits.add(new Split(index, Set.of(), false));
+        }
+        return restoreEnumerator(context, splits);
+    }
+
+    @Override
+    public SplitEnumerator<Split, List<Split>> restoreEnumerator(
+            SplitEnumeratorContext<Split> context, List<Split> checkpoint) {
+        if (mode == AcknowledgementMode.EXACTLY_ONCE && context.currentParallelism() != 1) {
+            throw new IllegalArgumentException("RabbitMQ exactly-once mode requires parallelism 1");
+        }
+        return new Enumerator(context, checkpoint);
+    }
+
+    @Override
+    public SimpleVersionedSerializer<Split> getSplitSerializer() {
+        return new SplitSerializer();
+    }
+
+    @Override
+    public SimpleVersionedSerializer<List<Split>> getEnumeratorCheckpointSerializer() {
+        return new EnumeratorSerializer();
+    }
+
+    /** Configure the RabbitMQ queue or bind it to an exchange before consuming. */
+    protected void setupQueue(Channel channel, String queue) throws IOException {
+        Util.declareQueueDefaults(channel, queue);
+    }
+
+    /** Opens a channel session; Flink, not the client, must recover it after connection loss. */
+    protected Connection setupConnection() throws Exception {
+        ConnectionFactory factory = config.getConnectionFactory();
+        factory.setAutomaticRecoveryEnabled(false);
+        return factory.newConnection();
+    }
+
+    /** One logical consumer assignment, not a disjoint partition or RabbitMQ offset. */
+    @PublicEvolving
+    public static final class Split implements SourceSplit {
+        private final int index;
+        private final Set<String> ids;
+        private final boolean finished;
+
+        Split(int index, Set<String> ids, boolean finished) {
+            this.index = index;
+            this.ids = Set.copyOf(ids);
+            this.finished = finished;
         }
 
         @Override
-        public void collect(OUT record) {
-            if (!customIdentifiersSet) {
-                boolean newMessage = setMessageIdentifiers(correlationId, deliveryTag);
-                if (!newMessage) {
-                    return;
-                }
-            }
-
-            if (isEndOfStream(record)) {
-                this.endOfStreamSignalled = true;
-                return;
-            }
-            ctx.collect(record);
+        public String splitId() {
+            return Integer.toString(index);
         }
+    }
 
-        public void setFallBackIdentifiers(String correlationId, long deliveryTag) {
-            this.correlationId = correlationId;
-            this.deliveryTag = deliveryTag;
-            this.customIdentifiersSet = false;
+    private static final class Enumerator implements SplitEnumerator<Split, List<Split>> {
+        private final SplitEnumeratorContext<Split> context;
+        private final Queue<Split> unassigned;
+
+        Enumerator(SplitEnumeratorContext<Split> context, Collection<Split> pending) {
+            this.context = context;
+            this.unassigned = new ArrayDeque<>(pending);
         }
 
         @Override
-        public boolean setMessageIdentifiers(String correlationId, long deliveryTag) {
-            if (customIdentifiersSet) {
-                throw new IllegalStateException(
-                        "You can set only a single set of identifiers for a block of messages.");
-            }
+        public void start() {}
 
-            this.customIdentifiersSet = true;
-            if (!autoAck) {
-                if (usesCorrelationId) {
-                    Preconditions.checkNotNull(
-                            correlationId,
-                            "RabbitMQ source was instantiated with usesCorrelationId set to "
-                                    + "true yet we couldn't extract the correlation id from it!");
-                    if (!addId(correlationId)) {
-                        // we have already processed this message
-                        try {
-                            channel.basicReject(deliveryTag, false);
-                        } catch (IOException e) {
-                            throw new RuntimeException(
-                                    "Message could not be acknowledged with basicReject.", e);
-                        }
-                        return false;
-                    }
-                }
-                sessionIds.add(deliveryTag);
+        @Override
+        public void handleSplitRequest(int subtaskId, String hostname) {
+            Split split = unassigned.poll();
+            if (split != null) {
+                context.assignSplit(split, subtaskId);
             }
-            return true;
+            context.signalNoMoreSplits(subtaskId);
         }
 
-        boolean isEndOfStream(OUT record) {
-            return endOfStreamSignalled || deliveryDeserializer.isEndOfStream(record);
+        @Override
+        public void addSplitsBack(List<Split> splits, int subtaskId) {
+            unassigned.addAll(splits);
         }
 
-        public boolean isEndOfStreamSignalled() {
-            return endOfStreamSignalled;
+        @Override
+        public void addReader(int subtaskId) {}
+
+        @Override
+        public List<Split> snapshotState(long checkpointId) {
+            return List.copyOf(unassigned);
         }
 
         @Override
         public void close() {}
+    }
+
+    private final class Reader implements SourceReader<OUT, Split> {
+        private final SourceReaderContext context;
+        private final Object deliveryLock = new Object();
+        private final Queue<Delivery> deliveries = new ArrayDeque<>();
+        // A restored ID starts with zero pending deliveries on the new channel.
+        private final Map<String, Integer> pendingById = new HashMap<>();
+        private final List<PendingAck> unsnapshotted = new ArrayList<>();
+        private final NavigableMap<Long, List<PendingAck>> checkpoints = new TreeMap<>();
+        private CompletableFuture<Void> available = new CompletableFuture<>();
+        private Throwable deliveryError;
+        private Split split;
+        private boolean started;
+        private boolean noMoreSplits;
+        private volatile boolean finished;
+        private Connection connection;
+        private Channel channel;
+
+        Reader(SourceReaderContext context) {
+            this.context = context;
+        }
+
+        @Override
+        public void start() {
+            started = true;
+            if (split == null) {
+                context.sendSplitRequest();
+            } else {
+                openConsumer();
+            }
+        }
+
+        @Override
+        public void addSplits(List<Split> splits) {
+            if (splits.size() != 1 || split != null) {
+                throw new IllegalArgumentException("RabbitMQ requires one split per reader");
+            }
+            split = splits.get(0);
+            split.ids.forEach(id -> pendingById.put(id, 0));
+            finished = split.finished;
+            if (started) {
+                openConsumer();
+            }
+        }
+
+        private void openConsumer() {
+            if (finished) {
+                signalAvailable();
+                return;
+            }
+            try {
+                schema.open(new DeserializationSchema.InitializationContext() {
+                    @Override
+                    public MetricGroup getMetricGroup() {
+                        return context.metricGroup().addGroup("user");
+                    }
+
+                    @Override
+                    public UserCodeClassLoader getUserCodeClassLoader() {
+                        return context.getUserCodeClassLoader();
+                    }
+                });
+                connection = setupConnection();
+                channel = connection.createChannel();
+                if (channel == null) {
+                    throw new IOException("RabbitMQ has no available channels");
+                }
+                setupQueue(channel, queueName);
+                channel.basicQos(config.getPrefetchCount().orElse(1000));
+                boolean autoAck = mode == AcknowledgementMode.AUTO_ACK;
+                if (!autoAck) {
+                    channel.txSelect();
+                }
+                channel.basicConsume(queueName, autoAck, new Consumer(channel));
+            } catch (Exception error) {
+                try {
+                    close();
+                } catch (Exception closeError) {
+                    error.addSuppressed(closeError);
+                }
+                throw new IllegalStateException("Could not start RabbitMQ consumer for " + queueName, error);
+            }
+        }
+
+        @Override
+        public InputStatus pollNext(ReaderOutput<OUT> output) throws IOException {
+            Delivery delivery;
+            synchronized (deliveryLock) {
+                if (deliveryError != null) {
+                    throw new IOException("RabbitMQ consumer disconnected", deliveryError);
+                }
+                if (split == null && noMoreSplits) {
+                    return InputStatus.END_OF_INPUT;
+                }
+                delivery = finished ? null : deliveries.poll();
+            }
+            if (delivery != null) {
+                processDelivery(delivery, output);
+            }
+            synchronized (deliveryLock) {
+                if (finished && (mode == AcknowledgementMode.AUTO_ACK
+                        || (unsnapshotted.isEmpty() && checkpoints.isEmpty()))) {
+                    return InputStatus.END_OF_INPUT;
+                }
+                if (deliveryError != null || (!finished && !deliveries.isEmpty())) {
+                    return InputStatus.MORE_AVAILABLE;
+                }
+                if (available.isDone()) {
+                    available = new CompletableFuture<>();
+                }
+                return InputStatus.NOTHING_AVAILABLE;
+            }
+        }
+
+        private void processDelivery(Delivery delivery, ReaderOutput<OUT> output) throws IOException {
+            Envelope envelope = delivery.getEnvelope();
+            AMQP.BasicProperties props = delivery.getProperties();
+            DeliveryCollector collector = new DeliveryCollector(props.getCorrelationId(), envelope.getDeliveryTag());
+            schema.deserialize(envelope, props, delivery.getBody(), collector);
+            String id = collector.id;
+            boolean emit = true;
+            if (mode == AcknowledgementMode.EXACTLY_ONCE) {
+                if (id == null || id.isEmpty()) {
+                    throw new IOException("RabbitMQ exactly-once mode requires a unique correlation ID");
+                }
+                Integer pending = pendingById.get(id);
+                emit = pending == null;
+                pendingById.put(id, emit ? 1 : pending + 1);
+            }
+            if (emit) {
+                for (OUT record : collector.records) {
+                    if (schema.isEndOfStream(record)) {
+                        finished = true;
+                        break;
+                    }
+                    output.collect(record);
+                }
+            }
+            if (mode != AcknowledgementMode.AUTO_ACK) {
+                unsnapshotted.add(new PendingAck(envelope.getDeliveryTag(), id));
+            }
+        }
+
+        @Override
+        public List<Split> snapshotState(long checkpointId) {
+            if (split == null) {
+                return List.of();
+            }
+            if (!unsnapshotted.isEmpty()) {
+                checkpoints.put(checkpointId, new ArrayList<>(unsnapshotted));
+                unsnapshotted.clear();
+            }
+            return List.of(new Split(split.index, pendingById.keySet(), finished));
+        }
+
+        @Override
+        public void notifyCheckpointComplete(long checkpointId) throws IOException {
+            // A later completed checkpoint also covers deliveries from earlier aborted checkpoints.
+            NavigableMap<Long, List<PendingAck>> ready = checkpoints.headMap(checkpointId, true);
+            if (ready.isEmpty()) {
+                return;
+            }
+            for (List<PendingAck> batch : ready.values()) {
+                for (PendingAck ack : batch) {
+                    channel.basicAck(ack.tag, false);
+                }
+            }
+            channel.txCommit();
+            if (mode == AcknowledgementMode.EXACTLY_ONCE) {
+                for (List<PendingAck> batch : ready.values()) {
+                    for (PendingAck ack : batch) {
+                        pendingById.compute(
+                                ack.id, (id, pending) -> pending == 1 ? null : pending - 1);
+                    }
+                }
+            }
+            ready.clear();
+            if (finished) {
+                signalAvailable();
+            }
+        }
+
+        @Override
+        public CompletableFuture<Void> isAvailable() {
+            synchronized (deliveryLock) {
+                return available;
+            }
+        }
+
+        @Override
+        public void notifyNoMoreSplits() {
+            noMoreSplits = true;
+            signalAvailable();
+        }
+
+        @Override
+        public void close() throws Exception {
+            try (Connection openConnection = connection; Channel openChannel = channel) {
+                // Close the channel before the connection so unacknowledged deliveries are requeued.
+            }
+        }
+
+        private void signalAvailable() {
+            synchronized (deliveryLock) {
+                available.complete(null);
+            }
+        }
+
+        private final class Consumer extends DefaultConsumer {
+            Consumer(Channel channel) {
+                super(channel);
+            }
+
+            @Override
+            public void handleDelivery(
+                    String tag, Envelope envelope, AMQP.BasicProperties props, byte[] body) {
+                synchronized (deliveryLock) {
+                    if (!finished) {
+                        deliveries.add(new Delivery(envelope, props, body));
+                        available.complete(null);
+                    }
+                }
+            }
+
+            @Override
+            public void handleCancel(String tag) {
+                fail(new IOException("RabbitMQ cancelled consumer " + tag));
+            }
+
+            @Override
+            public void handleShutdownSignal(String tag, ShutdownSignalException signal) {
+                fail(signal);
+            }
+
+            private void fail(Throwable error) {
+                synchronized (deliveryLock) {
+                    deliveryError = error;
+                    available.complete(null);
+                }
+            }
+        }
+
+        private final class DeliveryCollector implements RMQDeserializationSchema.RMQCollector<OUT> {
+            private final List<OUT> records = new ArrayList<>();
+            private final long tag;
+            private String id;
+            private boolean customIdSet;
+
+            DeliveryCollector(String id, long tag) {
+                this.id = id;
+                this.tag = tag;
+            }
+
+            @Override
+            public boolean setMessageIdentifiers(String correlationId, long deliveryTag) {
+                if (customIdSet || !records.isEmpty() || tag != deliveryTag) {
+                    throw new IllegalArgumentException(
+                            "Set the correlation ID once, before collecting, using the original delivery tag");
+                }
+                customIdSet = true;
+                id = correlationId;
+                return mode != AcknowledgementMode.EXACTLY_ONCE || !pendingById.containsKey(id);
+            }
+
+            @Override
+            public void collect(OUT record) {
+                records.add(record);
+            }
+
+            @Override
+            public void close() {}
+        }
+    }
+
+    private static final class PendingAck {
+        private final long tag;
+        private final String id;
+
+        PendingAck(long tag, String id) {
+            this.tag = tag;
+            this.id = id;
+        }
+    }
+
+    private static final class SplitSerializer implements SimpleVersionedSerializer<Split> {
+        @Override
+        public int getVersion() {
+            return 1;
+        }
+
+        @Override
+        public byte[] serialize(Split split) throws IOException {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream out = new DataOutputStream(bytes)) {
+                writeSplit(out, split);
+            }
+            return bytes.toByteArray();
+        }
+
+        @Override
+        public Split deserialize(int version, byte[] serialized) throws IOException {
+            checkVersion(version);
+            try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(serialized))) {
+                return readSplit(in);
+            }
+        }
+    }
+
+    private static final class EnumeratorSerializer implements SimpleVersionedSerializer<List<Split>> {
+        @Override
+        public int getVersion() {
+            return 1;
+        }
+
+        @Override
+        public byte[] serialize(List<Split> splits) throws IOException {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream out = new DataOutputStream(bytes)) {
+                out.writeInt(splits.size());
+                for (Split split : splits) {
+                    writeSplit(out, split);
+                }
+            }
+            return bytes.toByteArray();
+        }
+
+        @Override
+        public List<Split> deserialize(int version, byte[] serialized) throws IOException {
+            checkVersion(version);
+            try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(serialized))) {
+                int size = in.readInt();
+                List<Split> splits = new ArrayList<>();
+                for (int i = 0; i < size; i++) {
+                    splits.add(readSplit(in));
+                }
+                return splits;
+            }
+        }
+    }
+
+    private static void checkVersion(int version) throws IOException {
+        if (version != 1) {
+            throw new IOException("Unsupported RabbitMQ checkpoint version " + version);
+        }
+    }
+
+    private static void writeSplit(DataOutputStream out, Split split) throws IOException {
+        out.writeInt(split.index);
+        out.writeBoolean(split.finished);
+        out.writeInt(split.ids.size());
+        for (String id : split.ids) {
+            out.writeUTF(id);
+        }
+    }
+
+    private static Split readSplit(DataInputStream in) throws IOException {
+        int index = in.readInt();
+        boolean finished = in.readBoolean();
+        int size = in.readInt();
+        Set<String> ids = new HashSet<>();
+        for (int i = 0; i < size; i++) {
+            ids.add(in.readUTF());
+        }
+        return new Split(index, ids, finished);
     }
 }

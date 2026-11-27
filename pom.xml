@@ -29,7 +29,7 @@ under the License.
 
     <groupId>org.apache.flink</groupId>
     <artifactId>flink-connector-rabbitmq-parent</artifactId>
-    <version>3.1-SNAPSHOT</version>
+    <version>${revision}</version>
     <name>Flink : Connectors : RabbitMQ : Parent</name>
     <packaging>pom</packaging>
     <inceptionYear>2022</inceptionYear>
@@ -48,16 +48,18 @@ under the License.
     </modules>
 
     <properties>
-        <flink.version>1.16.0</flink.version>
+        <revision>3.1.0-1.20-SNAPSHOT</revision>
+        <flink.version>1.20.5</flink.version>
+        <flink.line>1.20</flink.line>
+        <maven.compiler.release>17</maven.compiler.release>
+        <target.java.version>17</target.java.version>
 
         <junit5.version>5.10.1</junit5.version>
         <assertj.version>3.23.1</assertj.version>
-        <testcontainers.version>1.19.3</testcontainers.version>
         <mockito.version>3.4.6</mockito.version>
         <hamcrest.version>1.3</hamcrest.version>
 
-        <japicmp.skip>false</japicmp.skip>
-        <japicmp.referenceVersion>3.0.0-1.16</japicmp.referenceVersion>
+        <japicmp.skip>true</japicmp.skip>
 
         <slf4j.version>1.7.36</slf4j.version>
         <log4j.version>2.17.2</log4j.version>
@@ -84,14 +86,6 @@ under the License.
 
         <!-- Test dependencies -->
         <dependency>
-            <groupId>org.junit</groupId>
-            <artifactId>junit-bom</artifactId>
-            <version>${junit5.version}</version>
-            <type>pom</type>
-            <scope>import</scope>
-        </dependency>
-
-        <dependency>
             <groupId>org.assertj</groupId>
             <artifactId>assertj-core</artifactId>
             <version>${assertj.version}</version>
@@ -104,18 +98,6 @@ under the License.
             <version>${mockito.version}</version>
             <type>jar</type>
             <scope>test</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <scope>test</scope>
-            <exclusions>
-                <exclusion>
-                    <groupId>com.fasterxml.jackson.core</groupId>
-                    <artifactId>jackson-annotations</artifactId>
-                </exclusion>
-            </exclusions>
         </dependency>
 
         <!-- Tests will have log4j as the default logging framework available -->
@@ -150,7 +132,7 @@ under the License.
             </exclusions>
         </dependency>
 
-        <!-- ArchUit test dependencies -->
+        <!-- ArchUnit test dependencies -->
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-architecture-tests-test</artifactId>
@@ -177,14 +159,15 @@ under the License.
     <dependencyManagement>
 
         <dependencies>
-            <!-- Flink dependencies -->
-
             <dependency>
-                <groupId>org.apache.flink</groupId>
-                <artifactId>flink-test-utils</artifactId>
-                <version>${flink.version}</version>
-                <scope>test</scope>
+                <groupId>org.junit</groupId>
+                <artifactId>junit-bom</artifactId>
+                <version>${junit5.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
+
+            <!-- Flink dependencies -->
 
             <dependency>
                 <groupId>org.apache.flink</groupId>
@@ -248,14 +231,6 @@ under the License.
             </dependency>
 
             <dependency>
-                <groupId>org.testcontainers</groupId>
-                <artifactId>testcontainers-bom</artifactId>
-                <version>${testcontainers.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-
-            <dependency>
                 <groupId>com.tngtech.archunit</groupId>
                 <artifactId>archunit</artifactId>
                 <scope>test</scope>
@@ -311,13 +286,6 @@ under the License.
 
             <!-- For dependency convergence -->
             <dependency>
-                <groupId>org.objenesis</groupId>
-                <artifactId>objenesis</artifactId>
-                <version>2.6</version>
-            </dependency>
-
-            <!-- For dependency convergence -->
-            <dependency>
                 <groupId>org.apache.commons</groupId>
                 <artifactId>commons-compress</artifactId>
                 <version>1.26.1</version>
@@ -353,8 +321,42 @@ under the License.
         </dependencies>
     </dependencyManagement>
 
+    <profiles>
+        <profile>
+            <id>flink-2.3</id>
+            <properties>
+                <revision>3.1.0-2.3-SNAPSHOT</revision>
+                <flink.version>2.3.0</flink.version>
+                <flink.line>2.3</flink.line>
+            </properties>
+        </profile>
+    </profiles>
+
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+                <version>1.7.3</version>
+                <configuration>
+                    <flattenMode>oss</flattenMode>
+                    <pomElements><dependencyManagement>expand</dependencyManagement></pomElements>
+                    <updatePomFile>true</updatePomFile>
+                    <outputDirectory>${project.build.directory}</outputDirectory>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>flatten</id>
+                        <phase>process-resources</phase>
+                        <goals><goal>flatten</goal></goals>
+                    </execution>
+                    <execution>
+                        <id>flatten-clean</id>
+                        <phase>clean</phase>
+                        <goals><goal>clean</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
 
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
@@ -375,21 +377,20 @@ under the License.
             </plugin>
 
             <plugin>
-                <!-- activate API compatibility checks -->
-                <groupId>io.github.zentol.japicmp</groupId>
-                <artifactId>japicmp-maven-plugin</artifactId>
-            </plugin>
-
-            <plugin>
                 <groupId>org.apache.rat</groupId>
                 <artifactId>apache-rat-plugin</artifactId>
                 <inherited>false</inherited>
+                <configuration>
+                    <excludes combine.children="append"><exclude>flake.lock</exclude></excludes>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-checkstyle-plugin</artifactId>
                 <configuration>
                     <includeTestSourceDirectory>false</includeTestSourceDirectory>
+                    <configLocation>${maven.multiModuleProjectDirectory}/tools/maven/checkstyle.xml</configLocation>
+                    <suppressionsLocation>${maven.multiModuleProjectDirectory}/tools/maven/suppressions.xml</suppressionsLocation>
                     <sourceDirectories>
                         <sourceDirectory>${project.build.sourceDirectory}</sourceDirectory>
                         <sourceDirectory>${project.build.testSourceDirectory}</sourceDirectory>
@@ -418,6 +419,7 @@ under the License.
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.1</version>
             </plugin>
 
             <plugin>
