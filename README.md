@@ -10,20 +10,48 @@ Learn more about Flink at [https://flink.apache.org/](https://flink.apache.org/)
 
 ## Building the Apache Flink RabbitMQ Connector from Source
 
-Prerequisites:
+The connector targets new Java DataStream jobs on Flink 1.20.5 and 2.3.0 with JDK 17.
+Select the artifact whose version suffix matches the Flink line:
 
-* Unix-like environment (we use Linux, Mac OS X)
-* Git
-* Maven (we recommend version 3.8.6)
-* Java 11
+| Flink | Connector version | Build profile |
+| --- | --- | --- |
+| 1.20.5 | `3.1.0-1.20-SNAPSHOT` | Default |
+| 2.3.0 | `3.1.0-2.3-SNAPSHOT` | `-Pflink-2.3` |
 
+The regular artifact is `org.apache.flink:flink-connector-rabbitmq`.
+The `flink-sql-connector-rabbitmq` artifact bundles the RabbitMQ client but does not provide a SQL table factory.
+
+Use JDK 17 and Maven, or enter the pinned environment with `nix develop`.
+
+```sh
+mvn clean install
+mvn -Pflink-2.3 clean install
 ```
-git clone https://github.com/apache/flink-connector-rabbitmq.git
-cd flink-connector-rabbitmq
-mvn clean package -DskipTests
+
+For reliable consumption, use the checkpointed `AT_LEAST_ONCE` source and make destination writes idempotent.
+When using `RMQSource.addTo(...)`, enable checkpointing before adding the source.
+The opt-in `EXACTLY_ONCE` mode deduplicates broker redelivery on checkpoint recovery; it does not deduplicate arbitrary producer retries or make the RabbitMQ sink exactly-once.
+See `docs/content/docs/connectors/datastream/rabbitmq.md` for setup and retry guidance.
+
+## Local End-to-End Tests
+
+With Nix flakes enabled, run from the repository root:
+
+```sh
+nix run .#e2e                       # both Flink versions
+nix run .#e2e -- --flink 1.20.5    # one version
+nix run .#e2e -- --flink 2.3.0
+nix run .#e2e -- --controls-only   # start both stacks without compiling the connector
 ```
 
-The resulting jars can be found in the `target` directory of the respective module.
+The runner starts a private RabbitMQ node and standalone Flink JobManager and TaskManager on loopback.
+It runs the Maven tests, verifies that external jobs can use the packaged artifacts, and checks broker redelivery and job recovery across a TaskManager crash.
+No Docker daemon or system RabbitMQ, JDK, or Maven is needed.
+The first run downloads Nix inputs, the Flink distributions, and Maven dependencies.
+The flake exposes `aarch64-darwin` and `x86_64-linux` environments.
+Each run prints its log directory under `/tmp` and stops the services at exit; logs and test state are retained for diagnosis.
+CI runs the same flake app.
+On an uncommitted checkout with new flake files, use `nix run path:.#e2e` so Nix can see the untracked files.
 
 ## Developing Flink
 

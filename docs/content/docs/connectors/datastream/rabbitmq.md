@@ -38,217 +38,78 @@ Users that create and publish derivative work based on Flink's
 RabbitMQ connector (thereby re-distributing the "RabbitMQ AMQP Java Client")
 must be aware that this may be subject to conditions declared in the Mozilla Public License 1.1 ("MPL"), the GNU General Public License version 2 ("GPL") and the Apache License version 2 ("ASL").
 
-## RabbitMQ Connector
+## Maven Dependency
 
-This connector provides access to data streams from [RabbitMQ](http://www.rabbitmq.com/). To use this connector, add the following dependency to your project:
+For new Java DataStream jobs, use `org.apache.flink:flink-connector-rabbitmq` with the version that matches your cluster:
 
-{{< connector_artifact flink-connector-rabbitmq rabbitmq >}}
+| Flink | Connector version | Java |
+| --- | --- | --- |
+| 1.20.5 | `3.1.0-1.20-SNAPSHOT` | 17 |
+| 2.3.0 | `3.1.0-2.3-SNAPSHOT` | 17 |
 
-{{< py_connector_download_link "rabbitmq" >}}
+These are development artifacts that you can build with `mvn clean install` or `mvn -Pflink-2.3 clean install`, respectively.
+The `flink-sql-connector-rabbitmq` JAR bundles and relocates the RabbitMQ Java client but does not implement SQL table discovery.
+Do not load the regular and shaded connector JARs together.
 
-Note that the streaming connectors are currently not part of the binary distribution. See linking with them for cluster execution [here]({{< ref "docs/dev/configuration/overview" >}}).
+## RabbitMQ Source
 
-### Installing RabbitMQ
-Follow the instructions from the [RabbitMQ download page](http://www.rabbitmq.com/download.html). After the installation the server automatically starts, and the application connecting to RabbitMQ can be launched.
+Use `RMQSource.addTo(...)` to add the source and validate checkpoint settings.
+A RabbitMQ queue distributes messages across competing consumers, not independent partitions with replayable offsets.
+The source provides three explicit acknowledgement modes:
 
-### RabbitMQ Source
+| Mode | Requirements and guarantees |
+| --- | --- |
+| `AT_LEAST_ONCE` (recommended) | Enable Flink checkpointing. The source acknowledges deliveries after a checkpoint completes. RabbitMQ can redeliver after a failure. Correlation IDs are not required, and parallel readers are supported. |
+| `EXACTLY_ONCE` (opt-in) | Enable Flink exactly-once checkpoints, use one source reader, and set a unique, nonempty correlation ID on each published message. This mode suppresses broker redelivery of records already covered by the restored checkpoint. It does not generally deduplicate producer retries or guarantee exactly-once delivery to a destination. |
+| `AUTO_ACK` | Checkpointing is not required. The broker can remove a delivery before the job has processed it; there is no recovery guarantee. |
 
-This connector provides a `RMQSource` class to consume messages from a RabbitMQ
-queue. This source provides three different levels of guarantees, depending
-on how it is configured with Flink:
+Configure checkpointing before calling `addTo(...)`, and do not disable or weaken it afterwards.
+If you call Flink's `env.fromSource(...)` directly, it does not perform the connector's checkpoint validation; a checkpointed mode will not acknowledge deliveries without completed checkpoints.
+The source reconnects by failing the Flink task, so configure a restart strategy for recovery.
+Producer correlation IDs are application-level identifiers; RabbitMQ delivery tags are scoped to one channel and are not checkpointed.
+On restore, an ID for an acknowledgement that may already have succeeded is kept until its delivery can be resolved; RabbitMQ has no way to query the original tag from the new channel.
+Restore only state created by this connector on the same supported Flink version and with the same source parallelism.
+Legacy savepoints and cross-version state migration are not supported.
 
-1. **Exactly-once**: In order to achieve exactly-once guarantees with the
-RabbitMQ source, the following is required -
- - *Enable checkpointing*: With checkpointing enabled, messages are only
- acknowledged (hence, removed from the RabbitMQ queue) when checkpoints
- are completed.
- - *Use correlation ids*: Correlation ids are a RabbitMQ application feature.
- You have to set it in the message properties when injecting messages into RabbitMQ.
- The correlation id is used by the source to deduplicate any messages that
- have been reprocessed when restoring from a checkpoint.
- - *Non-parallel source*: The source must be non-parallel (parallelism set
- to 1) in order to achieve exactly-once. This limitation is mainly due to
- RabbitMQ's approach to dispatching messages from a single queue to multiple
- consumers.
-
-
-2. **At-least-once**: When checkpointing is enabled, but correlation ids
-are not used or the source is parallel, the source only provides at-least-once
-guarantees.
-
-3. **No guarantee**: If checkpointing isn't enabled, the source does not
-have any strong delivery guarantees. Under this setting, instead of
-collaborating with Flink's checkpointing, messages will be automatically
-acknowledged once the source receives and processes them.
-
-Below is a code example for setting up an exactly-once RabbitMQ source.
-Inline comments explain which parts of the configuration can be ignored
-for more relaxed guarantees.
-
-{{< tabs "2674efc2-62ce-4c21-9399-7cf23c211f9f" >}}
-{{< tab "Java" >}}
 ```java
 final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-// checkpointing is required for exactly-once or at-least-once guarantees
-env.enableCheckpointing(...);
+env.enableCheckpointing(1000);
 
 final RMQConnectionConfig connectionConfig = new RMQConnectionConfig.Builder()
-    .setHost("localhost")
-    .setPort(5000)
-    ...
-    .build();
-    
-final DataStream<String> stream = env
-    .addSource(new RMQSource<String>(
-        connectionConfig,            // config for the RabbitMQ connection
-        "queueName",                 // name of the RabbitMQ queue to consume
-        true,                        // use correlation ids; can be false if only at-least-once is required
-        new SimpleStringSchema()))   // deserialization schema to turn messages into Java objects
-    .setParallelism(1);              // non-parallel source is only required for exactly-once
+        .setUri("amqp://guest:guest@localhost:5672/")
+        .setPrefetchCount(1000)
+        .build();
+
+final DataStream<String> stream = new RMQSource<>(
+        connectionConfig, "input", AcknowledgementMode.AT_LEAST_ONCE, new SimpleStringSchema())
+        .addTo(env, WatermarkStrategy.noWatermarks(), "RabbitMQ input");
 ```
-{{< /tab >}}
-{{< tab "Scala" >}}
-```scala
-val env = StreamExecutionEnvironment.getExecutionEnvironment
-// checkpointing is required for exactly-once or at-least-once guarantees
-env.enableCheckpointing(...)
 
-val connectionConfig = new RMQConnectionConfig.Builder()
-    .setHost("localhost")
-    .setPort(5000)
-    ...
-    .build
-    
-val stream = env
-    .addSource(new RMQSource[String](
-        connectionConfig,            // config for the RabbitMQ connection
-        "queueName",                 // name of the RabbitMQ queue to consume
-        true,                        // use correlation ids; can be false if only at-least-once is required
-        new SimpleStringSchema))     // deserialization schema to turn messages into Java objects
-    .setParallelism(1)               // non-parallel source is only required for exactly-once
-```
-{{< /tab >}}
-{{< tab "Python" >}}
-```python
-env = StreamExecutionEnvironment.get_execution_environment()
-# checkpointing is required for exactly-once or at-least-once guarantees
-env.enable_checkpointing(...)
+### Making Retries Safe
 
-connection_config = RMQConnectionConfig.Builder() \
-    .set_host("localhost") \
-    .set_port(5000) \
-    ...
-    .build()
+Give each logical event a stable event ID that producers reuse on retry.
+At an idempotent destination, record the event ID and apply its business effect in the same transaction, such as inserting the ID under a unique constraint before updating a balance.
+If duplicate events would change Flink state, deduplicate before the stateful operation; an idempotent sink cannot correct an inflated count.
+The RabbitMQ sink in this connector is not an idempotent destination and does not guarantee at-least-once delivery to RabbitMQ.
 
-stream = env \
-    .add_source(RMQSource(
-        connection_config,
-        "queueName",
-        True,
-        SimpleStringSchema(),
-    )) \
-    .set_parallelism(1)
-```
-{{< /tab >}}
-{{< /tabs >}}
+### Consumer Prefetch
 
-#### Quality of Service (QoS) / Consumer Prefetch
+The source configures `basicQos` per consumer; the default is 1,000 if prefetch is unset.
+Set `RMQConnectionConfig.Builder#setPrefetchCount` to adjust how many deliveries the broker can keep outstanding on each manually acknowledged consumer.
+Prefetch does not limit automatically acknowledged deliveries.
+For custom queue declarations or bindings, override `RMQSource#setupQueue(Channel, String)`.
 
-The RabbitMQ Source provides a simple way to set the `basicQos` on the source's channel through the `RMQConnectionConfig`.
-Since there is one connection/ channel per-parallel source, this prefetch count will effectively be multiplied by the
-source's parallelism for how many total unacknowledged messages can be sent to the job at one time.
-If more complex configuration is required, `RMQSource#setupChannel(Connection)` can be overridden and manually configured.
+## RabbitMQ Sink
 
-{{< tabs "e0b303d2-1bda-43fd-8335-f71eae1a8f6d" >}}
-{{< tab "Java" >}}
+Use `RMQSink` with `stream.sinkTo(...)`:
+
 ```java
-final RMQConnectionConfig connectionConfig = new RMQConnectionConfig.Builder()
-    .setPrefetchCount(30_000)
-    ...
-    .build();
-
+stream.sinkTo(new RMQSink<>(connectionConfig, "output", new SimpleStringSchema()));
 ```
-{{< /tab >}}
-{{< tab "Scala" >}}
-```scala
-val connectionConfig = new RMQConnectionConfig.Builder()
-    .setPrefetchCount(30000)
-    ...
-    .build
-```
-{{< /tab >}}
-{{< tab "Python" >}}
-```python
-connection_config = RMQConnectionConfig.Builder() \
-    .set_prefetch_count(30000) \
-    ...
-    .build()
-```
-{{< /tab >}}
-{{< /tabs >}}
 
-The prefetch count is unset by default, meaning the RabbitMQ server will send unlimited messages. In production, it
-is best to set this value. For high volume queues and checkpointing enabled, some tuning may be required to reduce
-wasted cycles, as messages are only acknowledged on checkpoints if enabled.
-
-More about QoS and prefetch can be found [here](https://www.rabbitmq.com/confirms.html#channel-qos-prefetch)
-and more about the options available in AMQP 0-9-1 [here](https://www.rabbitmq.com/consumer-prefetch.html).
-
-### RabbitMQ Sink
-This connector provides a `RMQSink` class for sending messages to a RabbitMQ
-queue. Below is a code example for setting up a RabbitMQ sink.
-
-{{< tabs "78baf6a6-5967-44cc-851d-bdf759598728" >}}
-{{< tab "Java" >}}
-```java
-final DataStream<String> stream = ...
-
-final RMQConnectionConfig connectionConfig = new RMQConnectionConfig.Builder()
-    .setHost("localhost")
-    .setPort(5000)
-    ...
-    .build();
-    
-stream.addSink(new RMQSink<String>(
-    connectionConfig,            // config for the RabbitMQ connection
-    "queueName",                 // name of the RabbitMQ queue to send messages to
-    new SimpleStringSchema()));  // serialization schema to turn Java objects to messages
-```
-{{< /tab >}}
-{{< tab "Scala" >}}
-```scala
-val stream: DataStream[String] = ...
-
-val connectionConfig = new RMQConnectionConfig.Builder()
-    .setHost("localhost")
-    .setPort(5000)
-    ...
-    .build
-    
-stream.addSink(new RMQSink[String](
-    connectionConfig,         // config for the RabbitMQ connection
-    "queueName",              // name of the RabbitMQ queue to send messages to
-    new SimpleStringSchema))  // serialization schema to turn Java objects to messages
-```
-{{< /tab >}}
-{{< tab "Python" >}}
-```python
-stream = ...
-
-connection_config = RMQConnectionConfig.Builder() \
-    .set_host("localhost") \
-    .set_port(5000) \
-    ...
-    .build()
-
-stream.add_sink(RMQSink(
-    connection_config,      # config for the RabbitMQ connection
-    'queueName',            # name of the RabbitMQ queue to send messages to
-    SimpleStringSchema()))  # serialization schema to turn Java objects to messages
-```
-{{< /tab >}}
-{{< /tabs >}}
-
-More about RabbitMQ can be found [here](http://www.rabbitmq.com/).
+Use `RMQSinkPublishOptions` to select the exchange, routing key and message properties.
+Mandatory publishes require a `SerializableReturnListener` to receive unroutable messages.
+Publish errors fail the writer by default; `setLogFailuresOnly(true)` logs and ignores publish I/O failures.
+The sink does not use publisher confirms or checkpoint-coordinated commits, and does not provide end-to-end exactly-once delivery to RabbitMQ.
 
 {{< top >}}

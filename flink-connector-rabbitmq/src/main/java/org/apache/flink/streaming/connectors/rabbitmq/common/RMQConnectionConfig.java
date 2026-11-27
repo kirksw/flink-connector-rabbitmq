@@ -286,7 +286,9 @@ public class RMQConnectionConfig implements Serializable {
      * explicitly, the default value of 30000 milliseconds will be returned.
      *
      * @return the message delivery timeout, in milliseconds
+     * @deprecated The FLIP-27 reader uses asynchronous delivery and does not use a delivery timeout.
      */
+    @Deprecated
     public long getDeliveryTimeout() {
         return deliveryTimeout;
     }
@@ -511,6 +513,8 @@ public class RMQConnectionConfig implements Serializable {
         /**
          * Enables or disables automatic connection recovery.
          *
+         * <p>The FLIP-27 source always lets Flink recover the connection instead.
+         *
          * @param automaticRecovery if true, enables connection recovery
          * @return the Builder
          */
@@ -521,7 +525,7 @@ public class RMQConnectionConfig implements Serializable {
 
         /**
          * Enables setting basicQos for the consumer channel. Only applicable to the {@link
-         * RMQSource}. Set to 0 for unlimited, which is the default.
+         * RMQSource}. Set to 0 for unlimited. The source defaults to 1,000 when unset.
          *
          * @see <a href="https://www.rabbitmq.com/consumer-prefetch.html">Consumer Prefetch</a>
          * @see <a href="https://www.rabbitmq.com/confirms.html#channel-qos-prefetch">Channel
@@ -536,7 +540,7 @@ public class RMQConnectionConfig implements Serializable {
 
         /**
          * Enables setting the message delivery timeout in the queueing consumer. Only applicable to
-         * the {@link RMQSource}. If not set it will default to 30000.
+         * the legacy source. The FLIP-27 source ignores this setting.
          *
          * @param deliveryTimeout maximum wait time, in milliseconds, for the next message delivery
          * @return the Builder
@@ -549,7 +553,7 @@ public class RMQConnectionConfig implements Serializable {
 
         /**
          * Enables setting the message delivery timeout in the queueing consumer. Only applicable to
-         * the {@link RMQSource}. If not set it will default to 30 seconds.
+         * the legacy source. The FLIP-27 source ignores this setting.
          *
          * @param deliveryTimeout maximum wait time for the next message delivery
          * @param unit deliveryTimeout unit

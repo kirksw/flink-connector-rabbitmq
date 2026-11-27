@@ -53,8 +53,7 @@ public interface RMQDeserializationSchema<T> extends Serializable, ResultTypeQue
      *
      * <p><b>NOTICE:</b> The implementation of this method can call {@link
      * RMQCollector#setMessageIdentifiers} with a custom correlation ID and delivery tag if
-     * checkpointing and {@code useCorrelationID} were enabled in the constructor of {@link
-     * RMQSource}.
+     * {@link RMQSource.AcknowledgementMode#EXACTLY_ONCE} is selected.
      *
      * @param envelope an AMQP {@link Envelope}.
      * @param properties the {@link AMQP.BasicProperties} of the message.
@@ -86,18 +85,18 @@ public interface RMQDeserializationSchema<T> extends Serializable, ResultTypeQue
      */
     interface RMQCollector<T> extends Collector<T> {
         /**
-         * Sets the correlation id and the delivery tag that corresponds to the records originating
+         * Sets a custom correlation ID and validates the delivery tag of the records originating
          * from the RMQ event. If the correlation id has been processed before, records will not be
          * emitted downstream.
          *
          * <p>If not set explicitly, the {@link AMQP.BasicProperties#getCorrelationId()} and {@link
          * Envelope#getDeliveryTag()} will be used.
          *
-         * <p><b>NOTE:</b>Can be called once for a single invocation of a {@link
+         * <p><b>NOTE:</b>Call once and before emitting any records in an invocation of {@link
          * RMQDeserializationSchema#deserialize(Envelope, AMQP.BasicProperties, byte[],
          * RMQCollector)} method.
          *
-         * @return true, if a message with given correlationId was seen before
+         * @return true if the delivery has not been deduplicated
          */
         boolean setMessageIdentifiers(String correlationId, long deliveryTag);
     }
